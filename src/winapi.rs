@@ -16,9 +16,10 @@ use windows::Win32::Foundation::{CloseHandle, HANDLE};
 #[cfg(windows)]
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FileDispositionInfoEx, FindClose, FindFirstFileExW, FindNextFileW,
-    SetFileInformationByHandle, DELETE, FILE_ATTRIBUTE_DIRECTORY, FILE_FLAG_BACKUP_SEMANTICS,
-    FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    FINDEX_INFO_LEVELS, FINDEX_SEARCH_OPS, FIND_FIRST_EX_FLAGS, OPEN_EXISTING, WIN32_FIND_DATAW,
+    SetFileInformationByHandle, DELETE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, FINDEX_INFO_LEVELS, FINDEX_SEARCH_OPS, FIND_FIRST_EX_FLAGS, OPEN_EXISTING,
+    WIN32_FIND_DATAW,
 };
 
 #[cfg(windows)]
@@ -134,7 +135,7 @@ pub fn remove_dir(path: &Path) -> io::Result<()> {
 #[cfg(windows)]
 pub fn enumerate_files<F>(dir: &Path, mut callback: F) -> io::Result<()>
 where
-    F: FnMut(&Path, bool) -> io::Result<()>,
+    F: FnMut(&Path, bool, bool) -> io::Result<()>,
 {
     let search_path = dir.join("*");
     let wide_path = path_to_wide(&search_path);
@@ -163,8 +164,10 @@ where
 
             if filename != "." && filename != ".." {
                 let is_dir = (find_data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY.0) != 0;
+                let is_reparse =
+                    (find_data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT.0) != 0;
                 let full_path = dir.join(&filename);
-                callback(&full_path, is_dir)?;
+                callback(&full_path, is_dir, is_reparse)?;
             }
 
             if FindNextFileW(handle, &mut find_data).is_err() {
@@ -182,13 +185,15 @@ where
 #[cfg(not(windows))]
 pub fn enumerate_files<F>(dir: &Path, mut callback: F) -> io::Result<()>
 where
-    F: FnMut(&Path, bool) -> io::Result<()>,
+    F: FnMut(&Path, bool, bool) -> io::Result<()>,
 {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
-        let is_dir = entry.file_type()?.is_dir();
-        callback(&path, is_dir)?;
+        let file_type = entry.file_type()?;
+        let is_reparse = file_type.is_symlink();
+        let is_dir = file_type.is_dir();
+        callback(&path, is_dir, is_reparse)?;
     }
     Ok(())
 }

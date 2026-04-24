@@ -8,14 +8,15 @@ use std::sync::Arc;
 
 /// Helper function to delete with pipeline
 fn delete_directory(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let tree = tree::discover_tree(path)?;
+    let mut tree = tree::discover_tree(path)?;
+    let reparse_dirs = Arc::new(std::mem::take(&mut tree.reparse_dirs));
     let (broker, tx, rx) = Broker::new(tree);
     let broker = Arc::new(broker);
 
     let error_tracker = Arc::new(worker::ErrorTracker::new());
     let config = worker::WorkerConfig::default();
 
-    let handles = worker::spawn_workers(4, rx, broker, config, error_tracker);
+    let handles = worker::spawn_workers(4, rx, broker, config, error_tracker, reparse_dirs);
     drop(tx);
 
     for handle in handles {

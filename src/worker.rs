@@ -4,6 +4,7 @@ use crate::broker::Broker;
 use crate::error::FailedItem;
 use crate::winapi::{delete_file, enumerate_files, remove_dir};
 use crossbeam_channel::Receiver;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -67,6 +68,7 @@ pub fn spawn_workers(
     broker: Arc<Broker>,
     config: WorkerConfig,
     error_tracker: Arc<ErrorTracker>,
+    reparse_dirs: Arc<HashSet<PathBuf>>,
 ) -> Vec<JoinHandle<()>> {
     (0..count)
         .map(|i| {
@@ -74,9 +76,10 @@ pub fn spawn_workers(
             let broker = broker.clone();
             let config = config.clone();
             let error_tracker = error_tracker.clone();
+            let reparse_dirs = reparse_dirs.clone();
             thread::Builder::new()
                 .name(format!("worker-{}", i))
-                .spawn(move || worker_thread(rx, broker, config, error_tracker))
+                .spawn(move || worker_thread(rx, broker, config, error_tracker, reparse_dirs))
                 .expect("Failed to spawn worker thread")
         })
         .collect()
@@ -87,16 +90,25 @@ pub fn worker_thread(
     broker: Arc<Broker>,
     config: WorkerConfig,
     error_tracker: Arc<ErrorTracker>,
+    reparse_dirs: Arc<HashSet<PathBuf>>,
 ) {
     while let Ok(dir) = rx.recv() {
-        if let Err(e) = delete_files_in_dir(&dir, &config, &error_tracker) {
-            let msg = format!("{}", e);
-            if config.verbose {
-                eprintln!(
-                    "Warning: Failed to delete files in {}: {}",
-                    dir.display(),
-                    msg
-                );
+        // For reparse-point dirs (junctions / directory symlinks), skip file
+        // enumeration — the link itself is what we want to delete, and
+        // descending would operate on the link *target* (possibly outside
+        // the requested tree, or nonexistent if the link is broken).
+        let is_reparse = reparse_dirs.contains(&dir);
+
+        if !is_reparse {
+            if let Err(e) = delete_files_in_dir(&dir, &config, &error_tracker) {
+                let msg = format!("{}", e);
+                if config.verbose {
+                    eprintln!(
+                        "Warning: Failed to delete files in {}: {}",
+                        dir.display(),
+                        msg
+                    );
+                }
             }
         }
 
@@ -124,8 +136,25 @@ fn delete_files_in_dir(
     config: &WorkerConfig,
     error_tracker: &Arc<ErrorTracker>,
 ) -> std::io::Result<()> {
-    enumerate_files(dir, |path, is_dir| {
-        if !is_dir {
+    enumerate_files(dir, |path, is_dir, is_reparse| {
+        // Regular files (not directories, not file symlinks recorded as dirs).
+        // Reparse-point entries are planned as their own directory-deletion
+        // work items by the tree scanner, so we skip them here.
+        if !is_dir && !is_reparse {
+            if let Err(e) = delete_file(path) {
+                let msg = format!("{}", e);
+                error_tracker.record_failure(FailedItem {
+                    path: path.to_path_buf(),
+                    error: msg.clone(),
+                    is_dir: false,
+                });
+
+                if config.verbose {
+                    eprintln!("Warning: Failed to delete {}: {}", path.display(), msg);
+                }
+            }
+        } else if !is_dir && is_reparse {
+            // File symlink: delete the link itself.
             if let Err(e) = delete_file(path) {
                 let msg = format!("{}", e);
                 error_tracker.record_failure(FailedItem {

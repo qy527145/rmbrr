@@ -221,6 +221,13 @@ fn process_single_path(path: &Path, args: &Args) -> Result<DeletionStats, Error>
         println!("DRY RUN MODE - no files will be deleted");
     }
 
+    // Canonicalize to an absolute path (with `\\?\` prefix on Windows).
+    // This bypasses Windows MAX_PATH (260 char) limit which otherwise causes
+    // silent failures deep inside nested node_modules trees, leading to
+    // ERROR_DIR_NOT_EMPTY (os error 145) when we try to remove the parent.
+    let canonical_path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let path = canonical_path.as_path();
+
     let worker_count = args.threads.unwrap_or_else(|| {
         std::thread::available_parallelism()
             .map(|n| n.get())
@@ -232,7 +239,8 @@ fn process_single_path(path: &Path, args: &Args) -> Result<DeletionStats, Error>
     }
     let start = Instant::now();
 
-    let tree = tree::discover_tree(path).map_err(|e| Error::io_with_path(path.to_path_buf(), e))?;
+    let mut tree =
+        tree::discover_tree(path).map_err(|e| Error::io_with_path(path.to_path_buf(), e))?;
 
     let scan_time = start.elapsed();
     let dir_count = tree.dirs.len();
@@ -293,6 +301,7 @@ fn process_single_path(path: &Path, args: &Args) -> Result<DeletionStats, Error>
         });
     }
 
+    let reparse_dirs = Arc::new(std::mem::take(&mut tree.reparse_dirs));
     let (broker, tx, rx) = Broker::new(tree);
     let broker = Arc::new(broker);
 
@@ -311,6 +320,7 @@ fn process_single_path(path: &Path, args: &Args) -> Result<DeletionStats, Error>
         broker.clone(),
         worker_config,
         error_tracker.clone(),
+        reparse_dirs,
     );
 
     drop(tx);

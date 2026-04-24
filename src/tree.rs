@@ -16,6 +16,9 @@ pub struct DirectoryTree {
     pub leaves: Vec<PathBuf>,
     /// Total number of files in the tree
     pub file_count: usize,
+    /// Directories that are reparse points (junctions / directory symlinks).
+    /// The link itself must be deleted, but the target must NOT be enumerated.
+    pub reparse_dirs: HashSet<PathBuf>,
 }
 
 impl DirectoryTree {
@@ -26,6 +29,7 @@ impl DirectoryTree {
             children: HashMap::new(),
             leaves: Vec::new(),
             file_count: 0,
+            reparse_dirs: HashSet::new(),
         }
     }
 }
@@ -49,6 +53,7 @@ pub fn discover_tree(root: &Path) -> io::Result<DirectoryTree> {
         &mut has_children,
         &mut file_count,
         &mut tree.files,
+        &mut tree.reparse_dirs,
     )?;
 
     tree.dirs = all_dirs.iter().cloned().collect();
@@ -72,14 +77,23 @@ fn scan_recursive(
     has_children: &mut HashSet<PathBuf>,
     file_count: &mut usize,
     files: &mut Vec<PathBuf>,
+    reparse_dirs: &mut HashSet<PathBuf>,
 ) -> io::Result<()> {
     all_dirs.insert(dir.to_path_buf());
 
     let mut child_dirs = Vec::new();
+    let mut reparse_children = Vec::new();
 
-    if let Err(e) = crate::winapi::enumerate_files(dir, |path, is_dir| {
+    if let Err(e) = crate::winapi::enumerate_files(dir, |path, is_dir, is_reparse| {
         if is_dir {
-            child_dirs.push(path.to_path_buf());
+            if is_reparse {
+                // Junction / directory symlink: plan to delete the link itself
+                // but never enumerate or recurse into it (target may live outside
+                // the requested tree, or the target may not exist).
+                reparse_children.push(path.to_path_buf());
+            } else {
+                child_dirs.push(path.to_path_buf());
+            }
         } else {
             *file_count += 1;
             files.push(path.to_path_buf());
@@ -90,7 +104,13 @@ fn scan_recursive(
         return Ok(());
     }
 
-    if !child_dirs.is_empty() {
+    for reparse_child in &reparse_children {
+        all_dirs.insert(reparse_child.clone());
+        reparse_dirs.insert(reparse_child.clone());
+    }
+
+    let total_child_dirs = child_dirs.len() + reparse_children.len();
+    if total_child_dirs > 0 {
         has_children.insert(dir.to_path_buf());
 
         for child in &child_dirs {
@@ -101,10 +121,13 @@ fn scan_recursive(
                 has_children,
                 file_count,
                 files,
+                reparse_dirs,
             )?;
         }
 
-        children_map.insert(dir.to_path_buf(), child_dirs);
+        let mut all_children = child_dirs;
+        all_children.extend(reparse_children);
+        children_map.insert(dir.to_path_buf(), all_children);
     }
 
     Ok(())
